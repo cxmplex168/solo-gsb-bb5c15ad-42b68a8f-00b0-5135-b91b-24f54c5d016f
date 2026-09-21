@@ -54,6 +54,10 @@ async def checkin(client: AsyncClient, bid: str, pid: str):
     return await client.post(f"/barriers/{bid}/checkin", json={"participant_id": pid})
 
 
+async def cancel(client: AsyncClient, bid: str, reason: str):
+    return await client.post(f"/barriers/{bid}/cancel", json={"reason": reason})
+
+
 @pytest.mark.asyncio
 async def test_health_and_root():
     async with await _client() as c:
@@ -373,3 +377,217 @@ async def test_concurrent_checkins_events_no_gap_no_dup():
             "late",
         }
         assert sum(1 for e in events if e["result"] == "reached") == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_basic_then_checkin_conflicts_and_views_expose_it():
+    """取消成功：状态 cancelled、保存 reason/cancelled_at；之后报到 409；
+    GET 与 wait 都返回取消信息；取消不产生报到事件。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=10)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        # 空 / 纯空白 reason 被 422 拒绝
+        assert (await cancel(c, bid, "   ")).status_code == 422
+        r = await cancel(c, bid, "  上游任务放弃等待  ")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["reason"] == "上游任务放弃等待"  # 首尾空白被去除
+        cancelled_at = body["cancelled_at"]
+        assert datetime.fromisoformat(cancelled_at).tzinfo is not None
+        assert body["view"]["status"] == "cancelled"
+        assert body["view"]["cancel_reason"] == "上游任务放弃等待"
+        assert body["view"]["cancelled_at"] == cancelled_at
+        # 取消时已有的报到作为快照保留
+        assert body["view"]["checked_in"] == ["a"]
+        assert body["view"]["checked_count"] == 1
+
+        # 之后任何名单成员报到均 409，且不写入 checked
+        r = await checkin(c, bid, "b")
+        assert r.status_code == 409
+        g = await c.get(f"/barriers/{bid}")
+        v = g.json()
+        assert v["status"] == "cancelled"
+        assert v["cancel_reason"] == "上游任务放弃等待"
+        assert v["cancelled_at"] == cancelled_at
+        assert v["checked_in"] == ["a"]
+
+        # wait 立即返回取消终态
+        t0 = time.time()
+        w = await c.get(f"/barriers/{bid}/wait")
+        assert w.status_code == 200
+        wv = w.json()
+        assert wv["status"] == "cancelled"
+        assert wv["cancel_reason"] == "上游任务放弃等待"
+        assert wv["cancelled_at"] == cancelled_at
+        assert time.time() - t0 < 2
+
+        # 取消后的报到不产生审计事件
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["result"] for e in events] == ["checked_in"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_is_idempotent_same_result():
+    """重复取消幂等：返回首次保存的 reason/cancelled_at，即使本次 reason 不同。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        r1 = await cancel(c, bid, "first reason")
+        assert r1.status_code == 200
+        first = r1.json()
+        assert first["status"] == "cancelled"
+
+        r2 = await cancel(c, bid, "second reason")
+        assert r2.status_code == 200
+        second = r2.json()
+        assert second["status"] == "already_cancelled"
+        assert second["reason"] == "first reason"
+        assert second["cancelled_at"] == first["cancelled_at"]
+        assert second["view"]["cancelled_at"] == first["cancelled_at"]
+        assert second["view"]["cancel_reason"] == "first reason"
+
+        # 终态视图仍是第一次的结果
+        g = await c.get(f"/barriers/{bid}")
+        assert g.json()["cancel_reason"] == "first reason"
+        assert g.json()["cancelled_at"] == first["cancelled_at"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_conflicts_when_reached_or_expired():
+    """已达标 → 取消 409 且冻结快照不变；已截止 → 取消 409。"""
+    async with await _client() as c:
+        # 已达标
+        b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=10)
+        bid = b["barrier_id"]
+        cr = await checkin(c, bid, "a")
+        assert cr.json()["status"] == "reached"
+        frozen_at = cr.json()["frozen_at"]
+
+        r = await cancel(c, bid, "too late")
+        assert r.status_code == 409, r.text
+        g = await c.get(f"/barriers/{bid}")
+        assert g.json()["status"] == "reached"
+        assert g.json()["frozen_at"] == frozen_at
+        assert g.json()["cancel_reason"] is None
+
+        # 已截止
+        b2 = await create_barrier(c, ["x", "y"], threshold=2, ttl_s=1)
+        bid2 = b2["barrier_id"]
+        await asyncio.sleep(1.2)
+        r = await cancel(c, bid2, "expired already")
+        assert r.status_code == 409
+        g = await c.get(f"/barriers/{bid2}")
+        assert g.json()["status"] == "expired"
+        assert g.json()["cancel_reason"] is None
+
+        # 不存在的屏障 → 404
+        assert (await cancel(c, "deadbeefdeadbeef", "nope")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_multiple_waiters_all_woken_on_cancel():
+    """多个等待者并发挂起，取消时必须全部立即拿到同一份取消结果。"""
+    async with await _client() as c:
+        members = ["c1", "c2", "c3", "c4"]
+        b = await create_barrier(c, members, threshold=4, ttl_s=10)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "c1")
+
+        async def wait_view():
+            async with await _client() as c2:
+                started = time.time()
+                r = await c2.get(f"/barriers/{bid}/wait")
+                return time.time() - started, r
+
+        waiters = [asyncio.create_task(wait_view()) for _ in range(4)]
+        await asyncio.sleep(0.4)  # 确保都已进入订阅+等待
+        rc = await cancel(c, bid, "stop all")
+        assert rc.status_code == 200
+        cancelled_at = rc.json()["cancelled_at"]
+
+        outcomes = await asyncio.gather(*waiters)
+        for elapsed, r in outcomes:
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["status"] == "cancelled"
+            assert body["cancel_reason"] == "stop all"
+            assert body["cancelled_at"] == cancelled_at
+            assert body["checked_in"] == ["c1"]
+            assert elapsed < 5, f"等待者未被及时唤醒: {elapsed:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_waiter_joining_after_cancel_gets_snapshot():
+    """晚加入的等待者：到达时屏障已取消，应立即得到取消快照（二次检查路径）。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["p", "q"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+        await cancel(c, bid, "called off")
+        await asyncio.sleep(0.1)
+        r = await c.get(f"/barriers/{bid}/wait")
+        assert r.json()["status"] == "cancelled"
+        assert r.json()["cancel_reason"] == "called off"
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_trigger_checkin_race_exactly_one_terminal_state():
+    """取消与达标报到的 Lua 脚本在 Redis 内原子竞争：交替两个脚本的入队顺序，
+    两个方向各跑多轮，先执行者成为唯一终态，败者必为冲突，终态绝不被改写。"""
+    from app.barrier_store import CHECKIN_SCRIPT, CANCEL_SCRIPT
+    from app.main import app
+
+    async with await _client() as c:
+        winners = []
+        r = app.state.store.redis
+
+        for i in range(40):
+            b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=10)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+            ]
+            now = f"{time.time():.3f}"
+            # 两个脚本放入同一个事务：EXEC 时 Redis 按入队顺序串行执行，
+            # 交替顺序即可稳定覆盖“先达标”与“先取消”两个方向。
+            pipe = r.pipeline(transaction=True)
+            if i % 2 == 0:
+                pipe.eval(CHECKIN_SCRIPT, 6, *keys, "a", now)
+                pipe.eval(CANCEL_SCRIPT, 6, *keys, "race", now)
+            else:
+                pipe.eval(CANCEL_SCRIPT, 6, *keys, "race", now)
+                pipe.eval(CHECKIN_SCRIPT, 6, *keys, "a", now)
+            first, second = await pipe.execute()
+
+            g = await c.get(f"/barriers/{bid}")
+            status = g.json()["status"]
+            assert status in ("reached", "cancelled")
+
+            if i % 2 == 0:
+                checkin_raw, cancel_raw = first, second
+            else:
+                cancel_raw, checkin_raw = first, second
+
+            if status == "reached":
+                # 先达标：报到脚本返回 reached；取消脚本返回 reached 冲突
+                assert checkin_raw[0] == "reached"
+                assert cancel_raw[0] == "reached"
+                # 终态不可改写：再取消 409
+                assert (await cancel(c, bid, "again")).status_code == 409
+            else:
+                # 先取消：取消脚本写入 cancelled；报到脚本返回 cancelled 冲突
+                assert cancel_raw[0] == "cancelled"
+                assert checkin_raw[0] == "cancelled"
+                # 终态不可改写：再报到 409
+                assert (await checkin(c, bid, "a")).status_code == 409
+            winners.append(status)
+
+        assert set(winners) == {"reached", "cancelled"}, Counter(winners)

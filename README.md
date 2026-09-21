@@ -5,7 +5,8 @@
 - 创建屏障时指定**参与者名单**、**达标人数（quorum）**和**截止时间**；
 - 参与者以自己的标识**幂等报到**；
 - 并发报到中**首次达到达标人数的瞬间，达标成员在 Redis 内被原子冻结**为快照，之后的任何报到（哪怕来自其他名单成员）都不会改写 `quorum` 与 `frozen_at`；
-- 提供**阻塞等待接口**：达标时立即返回冻结快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
+- 支持**主动取消**：取消与达标报到在 Redis 中**原子竞争**，先发生者成为唯一终态（`cancelled` 与 `reached` 互斥）；取消保存 `reason` / `cancelled_at` 并唤醒全部等待者；
+- 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
 
 ## 一条命令启动（含 Redis）
 
@@ -82,23 +83,57 @@ curl -s -X POST http://localhost:8000/barriers/<id>/checkin \
 - `reached`：**本次报到使屏障达标**，`triggered=true`，`quorum` 为冻结成员快照；
 - `late`：屏障已达标后才报到，仅记入 `late`，**冻结快照不变**。
 
-非名单成员 → `403`；屏障不存在/已回收 → `404`；截止后报到 → `409`。
+非名单成员 → `403`；屏障不存在/已回收 → `404`；截止后或取消后报到 → `409`。
 
-### 3. 阻塞等待 `GET /barriers/{barrier_id}/wait`
+### 3. 主动取消 `POST /barriers/{barrier_id}/cancel`
+
+请求体必须携带**非空** `reason`（纯空白字符串返回 `422`，首尾空白会被去除后保存）：
 
 ```bash
-curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标或截止
+curl -s -X POST http://localhost:8000/barriers/<id>/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"上游已放弃等待，提前收尾"}'
+```
+
+返回（`200`）：
+
+```json
+{
+  "barrier_id": "8f3c…",
+  "status": "cancelled",
+  "reason": "上游已放弃等待，提前收尾",
+  "cancelled_at": "2026-09-20T14:58:00.123000Z",
+  "view": { "status": "cancelled", "cancel_reason": "…", "cancelled_at": "…", "checked_in": ["node-a"] }
+}
+```
+
+终态竞争与冲突规则：
+
+- 取消与达标报到由两段 Redis Lua 脚本原子竞争，**先发生者成为唯一终态**：
+  - 取消先发生 → 状态 `cancelled`，保存 `reason` 与 `cancelled_at`，此后任何报到返回 `409`（连 `checked_in` 都不会被追加）；
+  - 达标先发生 → 取消返回 `409`，`quorum` / `frozen_at` 不变；
+  - 已截止 → 取消返回 `409`，缺席名单不变。**任何路径都不得改写既有终态。**
+- **重复取消幂等**：返回 `200` 且 `status` 为 `already_cancelled`，`reason` / `cancelled_at` 始终是首次保存的同一份结果（即使本次请求体里的 `reason` 不同）。
+- 取消成功会向 Pub/Sub 频道发布 `cancelled`，**唤醒全部已在 `/wait` 挂起的等待者**；发布丢失时仍有轮询兜底。
+- 取消时已有的报到名单作为快照保留在 `checked_in` 中；取消本身不是报到行为，不产生报到审计事件。
+- 屏障不存在/已回收 → `404`。
+
+### 4. 阻塞等待 `GET /barriers/{barrier_id}/wait`
+
+```bash
+curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取消或截止
 ```
 
 - 达标时立即返回 `status: "reached"`、冻结的 `quorum` 与 `frozen_at`；
+- 取消时立即返回 `status: "cancelled"`、`cancel_reason` 与 `cancelled_at`；
 - 截止时返回 `status: "expired"`、`checked_in` 已报到名单与 `missing` 缺席名单；
-- 任意数量的等待者并发挂起：达标发布一条 Pub/Sub 消息全部唤醒；订阅采用“先订阅后复查 + 轮询兜底”，消息丢失或错过发布也不会漏唤醒。
+- 任意数量的等待者并发挂起：达标 / 取消各发布一条 Pub/Sub 消息全部唤醒；订阅采用“先订阅后复查 + 轮询兜底”，消息丢失或错过发布也不会漏唤醒（截止不发布消息，由轮询在截止点自然到期兜底）。
 
-### 4. 非阻塞查询 `GET /barriers/{barrier_id}`
+### 5. 非阻塞查询 `GET /barriers/{barrier_id}`
 
-随时查看当前 `waiting / reached / expired` 状态、报到人数、冻结快照、缺席与迟到名单。
+随时查看当前 `waiting / reached / expired / cancelled` 状态、报到人数、冻结快照、缺席与迟到名单、取消原因与时间。
 
-### 5. 报到审计事件 `GET /barriers/{barrier_id}/events`
+### 6. 报到审计事件 `GET /barriers/{barrier_id}/events`
 
 ```bash
 curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
@@ -126,10 +161,10 @@ curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 
 ## 并发与一致性保证
 
-- 报到判定由一段 Lua 脚本完成：`名单校验 → 截止校验 → SADD → 人数判定 → 写入冻结快照` 整体原子执行。Redis 单线程串行执行脚本，因此并发报到**只有一个请求**得到 `reached`，冻结的成员集合与时间点唯一确定。
+- 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ SADD → 人数判定 → 写入冻结快照` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、取消原因均唯一确定。
 - 报到审计事件在同一 Lua 脚本内追加（`RPUSH` 到 `events` 列表，序号 = 列表长度 + 1），与状态变更同生共死：要么一起成功，要么都不发生；脚本串行执行保证 `seq` 从 1 连续递增、无空洞无重复。
-- 冻结后脚本的所有写路径都不会触碰 `frozen` 键；迟到报到只追加到 `checked` 集合并反映在 `late` 字段。
-- 报到响应里的发布（`PUBLISH reached`）在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态。
+- 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突。
+- 报到响应里的 `PUBLISH reached` 与取消响应里的 `PUBLISH cancelled` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态。
 - 截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读，避免引入额外调度组件。
 
 ## 本地不使用容器开发
@@ -147,7 +182,7 @@ REDIS_URL=redis://localhost:6379/0 uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py           FastAPI 路由与错误映射
-  barrier_store.py  Redis 键模型 + 原子报到 Lua 脚本（含审计事件）+ Pub/Sub
+  barrier_store.py  Redis 键模型 + 原子报到/取消 Lua 脚本（含审计事件）+ Pub/Sub
   service.py        状态机视图组装、阻塞等待
   models.py         请求/响应模型与校验
   config.py         环境变量配置

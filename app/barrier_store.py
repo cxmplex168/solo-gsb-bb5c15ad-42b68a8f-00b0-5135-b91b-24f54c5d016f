@@ -6,9 +6,14 @@
 ``barrier:{bid}:roster``   set   创建时声明的参与者名单
 ``barrier:{bid}:checked``  set   所有有效报到（含达标后的迟到报到）
 ``barrier:{bid}:frozen``   hash  达标冻结快照，仅在达标后存在（quorum/frozen_at）
+``barrier:{bid}:cancel``   hash  主动取消终态，仅在取消后存在（reason/cancelled_at）
 ``barrier:{bid}:events``   list  报到审计事件（JSON，seq 从 1 递增，只追加）
 
-频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息。
+``frozen`` 与 ``cancel`` 互斥：达标报到与主动取消由各自的 Lua 脚本原子竞争，
+Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路径都不得改写。
+
+频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
+在主动取消后发布 ``cancelled`` 消息。
 """
 
 from __future__ import annotations
@@ -26,11 +31,12 @@ from redis.asyncio import Redis
 # 状态取值：
 #   unknown             屏障不存在
 #   not_participant     报到者不在名单内
+#   late                屏障达标后报到，快照不变
+#   cancelled           屏障已被主动取消（与取消脚本原子竞争的败者）
 #   expired             已过截止时间
 #   reached             本次报到使屏障达标，已原子写入冻结快照
 #   checked_in          报到成功，屏障仍在等待
 #   already_checked_in  幂等重复报到（未达标前）
-#   late                屏障达标后报到，快照不变
 #
 # 四种成功状态（reached/checked_in/already_checked_in/late）都会在同一脚本内
 # 向 events 列表追加一条审计事件（seq 递增）；错误路径不产生任何事件。
@@ -40,6 +46,7 @@ local roster_key  = KEYS[2]
 local checked_key = KEYS[3]
 local frozen_key  = KEYS[4]
 local events_key  = KEYS[5]
+local cancel_key  = KEYS[6]
 local pid         = ARGV[1]
 local now         = tonumber(ARGV[2])
 
@@ -51,6 +58,7 @@ local function refresh_ttl()
         redis.call('PEXPIRE', checked_key, ttl_ms)
         redis.call('PEXPIRE', frozen_key, ttl_ms)
         redis.call('PEXPIRE', events_key, ttl_ms)
+        redis.call('PEXPIRE', cancel_key, ttl_ms)
     end
 end
 
@@ -84,6 +92,12 @@ if quorum then
     return {'late', '0', quorum, redis.call('HGET', frozen_key, 'frozen_at')}
 end
 
+-- 主动取消之后：取消键已存在，报到不得再写入任何状态（连 checked 也不追加）。
+-- cancelled 与 reached 同为终态：若能走到这里说明取消脚本先于本脚本提交。
+if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+    return {'cancelled', '0', '', '0'}
+end
+
 local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
 if now >= deadline then
     return {'expired', '0', '', '0'}
@@ -115,6 +129,54 @@ return {'already_checked_in', '0', '', '0'}
 """
 
 
+# 取消脚本。返回数组：
+#   {'unknown'}                          屏障不存在
+#   {'reached', quorum, frozen_at}       已达标，终态不可改写，取消被拒绝
+#   {'expired'}                          已过截止时间，取消被拒绝
+#   {'cancelled', reason, cancelled_at}  本次请求完成取消（唯一一次写入）
+#   {'already_cancelled', reason, ts}    重复取消，幂等返回既有取消结果
+#
+# 与报到脚本的竞争完全由 Redis 单线程串行化保证：本脚本检查 frozen/cancel 与
+# 写入 cancel 键之间不可能插入达标报到；反之报到脚本也会先看到 cancel 键。
+CANCEL_SCRIPT = """
+local meta_key   = KEYS[1]
+local frozen_key = KEYS[4]
+local cancel_key = KEYS[6]
+local reason     = ARGV[1]
+local now        = tonumber(ARGV[2])
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 既有终态一律不得改写：已取消则幂等返回原结果；已达标则拒绝。
+local cancelled_at = redis.call('HGET', cancel_key, 'cancelled_at')
+if cancelled_at then
+    return {'already_cancelled', redis.call('HGET', cancel_key, 'reason'), cancelled_at}
+end
+
+local quorum = redis.call('HGET', frozen_key, 'quorum')
+if quorum then
+    return {'reached', quorum, redis.call('HGET', frozen_key, 'frozen_at')}
+end
+
+-- 已截止也是终态（expired），取消不得覆盖。
+local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+if now >= deadline then
+    return {'expired'}
+end
+
+local now_str = tostring(now)
+redis.call('HSET', cancel_key, 'reason', reason, 'cancelled_at', now_str)
+
+local ttl_ms = tonumber(redis.call('HGET', meta_key, 'ttl_ms'))
+if ttl_ms then
+    redis.call('PEXPIRE', cancel_key, ttl_ms)
+end
+return {'cancelled', reason, now_str}
+"""
+
+
 class BarrierNotFound(Exception):
     """屏障不存在或已过期清理。"""
 
@@ -125,6 +187,14 @@ class NotAParticipant(Exception):
 
 class BarrierExpired(Exception):
     """屏障已过截止时间且未达标。"""
+
+
+class BarrierReached(Exception):
+    """屏障已达标冻结，终态不可改写（取消被拒绝）。"""
+
+
+class BarrierCancelled(Exception):
+    """屏障已被主动取消，后续报到被拒绝。"""
 
 
 @dataclass(frozen=True)
@@ -155,22 +225,36 @@ class CheckinResult:
         return self.status in ("reached", "late")
 
 
+@dataclass(frozen=True)
+class CancelResult:
+    # cancelled（本次完成取消）| already_cancelled（重复取消，幂等）
+    status: str
+    reason: str
+    cancelled_at: float
+
+    @property
+    def idempotent(self) -> bool:
+        return self.status == "already_cancelled"
+
+
 class BarrierStore:
     def __init__(self, redis: Redis) -> None:
         self.redis = redis
         self._checkin = redis.register_script(CHECKIN_SCRIPT)
+        self._cancel = redis.register_script(CANCEL_SCRIPT)
 
     @staticmethod
     def channel(barrier_id: str) -> str:
         return f"barrier:{barrier_id}:events"
 
-    def _keys(self, barrier_id: str) -> tuple[str, str, str, str, str]:
+    def _keys(self, barrier_id: str) -> tuple[str, str, str, str, str, str]:
         return (
             f"barrier:{barrier_id}",
             f"barrier:{barrier_id}:roster",
             f"barrier:{barrier_id}:checked",
             f"barrier:{barrier_id}:frozen",
             f"barrier:{barrier_id}:events",
+            f"barrier:{barrier_id}:cancel",
         )
 
     async def create(
@@ -183,7 +267,7 @@ class BarrierStore:
         creator_id: str | None = None,
     ) -> BarrierMeta:
         barrier_id = uuid.uuid4().hex
-        meta_key, roster_key, _, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _, _ = self._keys(barrier_id)
         mapping: dict[str, Any] = {
             "threshold": threshold,
             "deadline": f"{deadline_ts:.3f}",
@@ -211,7 +295,7 @@ class BarrierStore:
         )
 
     async def get_meta(self, barrier_id: str) -> BarrierMeta | None:
-        meta_key, roster_key, _, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(meta_key)
         if not data:
             return None
@@ -240,6 +324,8 @@ class BarrierStore:
             raise NotAParticipant(participant_id)
         if status == "expired":
             raise BarrierExpired(barrier_id)
+        if status == "cancelled":
+            raise BarrierCancelled(barrier_id)
 
         result = CheckinResult(
             status=status,
@@ -255,8 +341,38 @@ class BarrierStore:
 
         return result
 
+    async def cancel(self, barrier_id: str, reason: str) -> CancelResult:
+        """主动取消；与达标报到原子竞争，先发生者成为唯一终态。
+
+        已取消时幂等返回同一取消结果；已达标 / 已截止抛出终态冲突异常。
+        """
+        keys = self._keys(barrier_id)
+        raw = await self._cancel(
+            keys=list(keys), args=[reason, f"{time.time():.3f}"]
+        )
+        status = raw[0]
+
+        if status == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if status == "reached":
+            raise BarrierReached(barrier_id)
+        if status == "expired":
+            raise BarrierExpired(barrier_id)
+
+        result = CancelResult(
+            status=status,
+            reason=raw[1],
+            cancelled_at=float(raw[2]),
+        )
+
+        # 仅本次真正完成取消时发布唤醒；重复取消不重复广播。
+        if status == "cancelled":
+            await self.redis.publish(self.channel(barrier_id), "cancelled")
+
+        return result
+
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:
-        _, _, _, frozen_key, _ = self._keys(barrier_id)
+        _, _, _, frozen_key, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(frozen_key)
         if not data:
             return None
@@ -265,8 +381,18 @@ class BarrierStore:
             "frozen_at": float(data["frozen_at"]),
         }
 
+    async def get_cancelled(self, barrier_id: str) -> dict[str, Any] | None:
+        *_, cancel_key = self._keys(barrier_id)
+        data = await self.redis.hgetall(cancel_key)
+        if not data:
+            return None
+        return {
+            "reason": data["reason"],
+            "cancelled_at": float(data["cancelled_at"]),
+        }
+
     async def checked_members(self, barrier_id: str) -> set[str]:
-        _, _, checked_key, _, _ = self._keys(barrier_id)
+        _, _, checked_key, _, _, _ = self._keys(barrier_id)
         return await self.redis.smembers(checked_key)
 
     async def list_events(
@@ -277,7 +403,7 @@ class BarrierStore:
         事件只追加且 seq 与列表下标一一对应（下标 = seq - 1），并发报到
         只会让游标右侧变长，已读区间稳定，因此游标分页不重不漏。
         """
-        *_, events_key = self._keys(barrier_id)
+        _, _, _, _, events_key, _ = self._keys(barrier_id)
         raw = await self.redis.lrange(events_key, cursor, cursor + limit - 1)
         events = [json.loads(item) for item in raw]
         next_cursor = events[-1]["seq"] if events else cursor

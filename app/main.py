@@ -1,11 +1,12 @@
 """并行任务协调收尾屏障 API。
 
 路由：
-  POST   /barriers                 创建屏障（参与者名单、达标人数、截止时间）
-  GET    /barriers/{bid}           查询当前状态（不阻塞）
-  POST   /barriers/{bid}/checkin   参与者幂等报到
-  GET    /barriers/{bid}/wait      阻塞等待达标 / 截止
-  GET    /barriers/{bid}/events    报到审计事件（cursor/limit 分页）
+  POST   /barriers                   创建屏障（参与者名单、达标人数、截止时间）
+  GET    /barriers/{bid}             查询当前状态（不阻塞）
+  POST   /barriers/{bid}/checkin     参与者幂等报到
+  POST   /barriers/{bid}/cancel      主动取消（与达标报到原子竞争，先发生者为唯一终态）
+  GET    /barriers/{bid}/wait        阻塞等待达标 / 取消 / 截止
+  GET    /barriers/{bid}/events      报到审计事件（cursor/limit 分页）
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -21,8 +22,10 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .barrier_store import (
+    BarrierCancelled,
     BarrierExpired,
     BarrierNotFound,
+    BarrierReached,
     BarrierStore,
     NotAParticipant,
 )
@@ -30,6 +33,8 @@ from .config import load_settings
 from .models import (
     BarrierEventsPage,
     BarrierView,
+    CancelRequest,
+    CancelResponse,
     CheckinEvent,
     CheckinRequest,
     CheckinResponse,
@@ -50,8 +55,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="任务收尾屏障 API",
-    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标或截止。",
-    version="1.0.0",
+    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -77,6 +82,7 @@ async def root() -> dict[str, object]:
             "create": "POST /barriers",
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
+            "cancel": "POST /barriers/{barrier_id}/cancel",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
         },
@@ -142,7 +148,8 @@ async def checkin(
 
     - 重复报到返回 already_checked_in / late，不改变任何结果；
     - 并发报到首次达到达标人数时，达标成员在 Redis Lua 脚本内被原子冻结；
-    - 冻结之后的报到只会记录为迟到，quorum 与 frozen_at 永不改写。
+    - 冻结之后的报到只会记录为迟到，quorum 与 frozen_at 永不改写；
+    - 屏障被取消后报到返回 409，取消终态不受任何影响。
     """
     meta = await _load_meta(request, barrier_id)
     svc = store(request)
@@ -155,6 +162,8 @@ async def checkin(
         )
     except BarrierExpired:
         raise HTTPException(status_code=409, detail="屏障已过截止时间，报到被拒绝")
+    except BarrierCancelled:
+        raise HTTPException(status_code=409, detail="屏障已被取消，报到被拒绝")
     except BarrierNotFound:
         raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
 
@@ -170,11 +179,48 @@ async def checkin(
     )
 
 
+@app.post(
+    "/barriers/{barrier_id}/cancel",
+    response_model=CancelResponse,
+    tags=["barriers"],
+)
+async def cancel_barrier(
+    barrier_id: str, payload: CancelRequest, request: Request
+) -> CancelResponse:
+    """主动取消屏障。
+
+    - 取消与达标报到在 Redis 中原子竞争：先发生者成为唯一终态；
+    - 取消成功后状态为 cancelled 并保存 reason / cancelled_at，此后报到返回 409；
+    - 已达标或已截止后取消返回 409，任何路径都不得改写既有终态；
+    - 重复取消幂等：返回首次保存的同一份 reason 与 cancelled_at；
+    - 取消成功会唤醒全部已在 /wait 挂起的等待者。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+    try:
+        result = await svc.cancel(barrier_id, payload.reason)
+    except BarrierReached:
+        raise HTTPException(status_code=409, detail="屏障已达标，终态不可取消")
+    except BarrierExpired:
+        raise HTTPException(status_code=409, detail="屏障已过截止时间，取消被拒绝")
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    view = await build_view(svc, meta)
+    return CancelResponse(
+        barrier_id=barrier_id,
+        status=result.status,
+        reason=result.reason,
+        cancelled_at=_dt(result.cancelled_at),
+        view=view,
+    )
+
+
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])
 async def wait_barrier(barrier_id: str, request: Request) -> BarrierView:
-    """阻塞等待直到屏障达标（立即返回冻结快照）或截止（返回报到成员与缺席名单）。
+    """阻塞等待直到屏障达标、被取消（立即返回终态快照）或截止（返回报到成员与缺席名单）。
 
-    多个等待者同时挂起：达标时通过 Redis Pub/Sub 一并唤醒，轮询为兜底。
+    多个等待者同时挂起：达标或取消时通过 Redis Pub/Sub 一并唤醒，轮询为兜底。
     最长挂起时间受 BARRIER_MAX_WAIT_S 限制。
     """
     meta = await _load_meta(request, barrier_id)

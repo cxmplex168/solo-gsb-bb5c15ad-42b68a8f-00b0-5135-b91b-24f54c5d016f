@@ -49,7 +49,7 @@ class CreateBarrierRequest(BaseModel):
 
 class BarrierView(BaseModel):
     barrier_id: str
-    status: str = Field(description="waiting | reached | expired")
+    status: str = Field(description="waiting | reached | expired | cancelled")
     participants: list[str]
     threshold: int
     deadline: datetime
@@ -64,6 +64,9 @@ class BarrierView(BaseModel):
     missing: list[str] | None = None
     # 达标冻结之后才报到的成员（reached 状态的补充信息，不改写结果）
     late: list[str] | None = None
+    # 主动取消的原因与时间（仅 cancelled）
+    cancel_reason: str | None = None
+    cancelled_at: datetime | None = None
     creator_id: str | None = None
 
 
@@ -82,6 +85,32 @@ class CheckinResponse(BaseModel):
     triggered: bool
     quorum: list[str] | None = None
     frozen_at: datetime | None = None
+    view: BarrierView
+
+
+class CancelRequest(BaseModel):
+    reason: str = Field(
+        ...,
+        min_length=1,
+        description="取消原因，非空；去除首尾空白后不得为空字符串",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "CancelRequest":
+        reason = self.reason.strip()
+        if not reason:
+            raise ValueError("reason 不得为空白字符串")
+        self.reason = reason
+        return self
+
+
+class CancelResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(
+        description="cancelled（本次完成取消）| already_cancelled（重复取消，幂等返回同一结果）"
+    )
+    reason: str = Field(description="取消原因；重复取消时返回首次保存的原因")
+    cancelled_at: datetime
     view: BarrierView
 
 
