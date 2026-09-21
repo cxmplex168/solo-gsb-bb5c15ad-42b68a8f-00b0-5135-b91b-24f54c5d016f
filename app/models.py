@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class CreateBarrierRequest(BaseModel):
@@ -49,7 +49,7 @@ class CreateBarrierRequest(BaseModel):
 
 class BarrierView(BaseModel):
     barrier_id: str
-    status: str = Field(description="waiting | reached | expired")
+    status: str = Field(description="waiting | reached | cancelled | expired")
     participants: list[str]
     threshold: int
     deadline: datetime
@@ -60,6 +60,9 @@ class BarrierView(BaseModel):
     # 达标后冻结的成员名单（仅 reached）
     quorum: list[str] | None = None
     frozen_at: datetime | None = None
+    # 主动取消的原因与时间（仅 cancelled）
+    cancel_reason: str | None = None
+    cancelled_at: datetime | None = None
     # 截止时仍未报到的成员（仅 expired）
     missing: list[str] | None = None
     # 达标冻结之后才报到的成员（reached 状态的补充信息，不改写结果）
@@ -69,6 +72,35 @@ class BarrierView(BaseModel):
 
 class CheckinRequest(BaseModel):
     participant_id: str = Field(..., min_length=1, description="参与者标识")
+
+
+class CancelRequest(BaseModel):
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="取消原因，非空（去首尾空白后仍须非空）",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        reason = v.strip()
+        if not reason:
+            raise ValueError("reason 不得为空白")
+        return reason
+
+
+class CancelResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(
+        description="cancelled（本次取消成功）| already（重复取消的幂等回放）"
+    )
+    reason: str = Field(description="取消原因；重复取消时返回首次提交的原因")
+    cancelled_at: datetime
+    # 重复取消（携带不同原因）也返回首次取消结果；true 表示本次为幂等回放
+    idempotent: bool = False
+    view: BarrierView
 
 
 class CheckinResponse(BaseModel):

@@ -16,13 +16,15 @@ def _dt(ts: float) -> datetime:
 async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None = None) -> BarrierView:
     """读取当前屏障状态并组装视图。
 
-    状态机：
-      reached  —— 存在冻结快照（达标成员已被原子固定）
-      expired  —— 无冻结快照且 now >= deadline
-      waiting  —— 其余情况
+    状态机（终态互斥，先发生者唯一）：
+      reached    —— 存在冻结快照（达标成员已被原子固定）
+      cancelled  —— 存在取消记录（在达标与截止之前主动取消）
+      expired    —— 无冻结/取消且 now >= deadline
+      waiting    —— 其余情况
     """
     now = now if now is not None else time.time()
     frozen = await store.get_frozen(meta.barrier_id)
+    cancel = await store.get_cancel(meta.barrier_id)
     checked = await store.checked_members(meta.barrier_id)
 
     if frozen is not None:
@@ -41,6 +43,22 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             quorum=quorum,
             frozen_at=_dt(frozen["frozen_at"]),
             late=late or None,
+            creator_id=meta.creator_id,
+        )
+
+    if cancel is not None:
+        checked_sorted = sorted(checked)
+        return BarrierView(
+            barrier_id=meta.barrier_id,
+            status="cancelled",
+            participants=meta.participants,
+            threshold=meta.threshold,
+            deadline=_dt(meta.deadline),
+            created_at=_dt(meta.created_at),
+            checked_in=checked_sorted,
+            checked_count=len(checked_sorted),
+            cancel_reason=cancel["reason"],
+            cancelled_at=_dt(cancel["cancelled_at"]),
             creator_id=meta.creator_id,
         )
 
@@ -75,31 +93,36 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
     )
 
 
+# 三个互斥终态：任一出现即结束等待
+SETTLED_STATUSES = frozenset({"reached", "cancelled", "expired"})
+
+
 async def wait_for_settle(
     store: BarrierStore,
     meta: BarrierMeta,
     poll_interval_s: float,
     max_wait_s: float,
 ) -> BarrierView:
-    """阻塞直到屏障达标或截止。
+    """阻塞直到屏障达标、被取消或截止。
 
     主通道为 Pub/Sub：先订阅，再检查一次状态（消除“先检查后订阅”的丢消息窗口）；
     轮询作为兜底，覆盖发布丢失 / 截止时间到达（截止不发布消息）两种情况。
-    多个等待者各自订阅同一频道，达标发布时全部被唤醒。
+    多个等待者各自订阅同一频道，达标发布 ``reached``、取消发布 ``cancelled``
+    时全部被唤醒。
     """
     deadline_d = meta.deadline
 
-    # 已经有结果则立即返回（达标快照或截止结果）
+    # 已经有结果则立即返回（达标快照 / 取消结果 / 截止结果）
     first = await build_view(store, meta)
-    if first.status in ("reached", "expired"):
+    if first.status in SETTLED_STATUSES:
         return first
 
     pubsub = store.redis.pubsub()
     await pubsub.subscribe(store.channel(meta.barrier_id))
     try:
-        # 订阅成功后再次检查：达标发布可能发生在第一次检查与订阅之间
+        # 订阅成功后再次检查：终态发布可能发生在第一次检查与订阅之间
         second = await build_view(store, meta)
-        if second.status in ("reached", "expired"):
+        if second.status in SETTLED_STATUSES:
             return second
 
         start = time.time()
@@ -121,9 +144,9 @@ async def wait_for_settle(
                 )
 
             # 无论被消息唤醒还是轮询到期，都回读真实状态：
-            # 达标则立即返回冻结快照；到达截止则返回报到名单与缺席名单。
+            # 达标则返回冻结快照；取消则返回原因与时间；到达截止则返回报到/缺席名单。
             view = await build_view(store, meta)
-            if view.status in ("reached", "expired"):
+            if view.status in SETTLED_STATUSES:
                 return view
     finally:
         try:
